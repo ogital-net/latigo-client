@@ -1,0 +1,15 @@
+[package]
+name = "latigo-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastrand = "2"
+jasonrpc = { version = "0.8", features = ["client", "tokio", "netstring"] }
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-aws-lc = "0.5"
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
