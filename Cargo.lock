@@ -202,6 +202,7 @@ version = "0.1.0"
 dependencies = [
  "fastrand",
  "jasonrpc",
+ "log",
  "rcgen",
  "socket2",
  "tokio",

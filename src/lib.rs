@@ -3,6 +3,7 @@
 use std::{
     future::Future,
     io,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -18,10 +19,10 @@ use jasonrpc::{
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
+    net::{TcpStream, lookup_host},
     sync::{Semaphore, SemaphorePermit, watch},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_aws_lc::{ClientConfig, ClientConfigBuilder, TlsConnector};
 
@@ -234,10 +235,12 @@ impl std::error::Error for TransportError {
 impl Transport {
     /// Start connecting immediately, retrying failures indefinitely.
     ///
-    /// DNS resolution, TCP connection, and TLS negotiation share a ten-second
-    /// deadline. Backoff starts at 250 ms, doubles to 30 seconds, and is jittered
-    /// by up to 50 percent without exceeding the cap. Thirty seconds connected
-    /// resets backoff. Dropping the last transport clone cancels its supervisor.
+    /// Each connection round resolves the host and tries its addresses in a
+    /// fresh random order. DNS, TCP, and TLS share a ten-second deadline; a
+    /// failed or stalled address leaves the remaining addresses a chance.
+    /// Backoff starts at 250 ms, doubles to 30 seconds, and is jittered by up to
+    /// 50 percent without exceeding the cap. Thirty seconds connected resets
+    /// backoff. Dropping the last transport clone cancels its supervisor.
     ///
     /// Must be called within a Tokio runtime with I/O and time enabled.
     pub fn start(config: Config) -> Self {
@@ -368,10 +371,16 @@ impl RpcTransport for Transport {
 
 impl Inner {
     fn shutdown(&self) {
-        let mut slot = self.session.lock().unwrap();
-        *slot = SessionSlot::Stopped;
-        self.state.send_replace(ConnectionState::Stopped);
-        self.task.abort();
+        {
+            let mut slot = self.session.lock().unwrap();
+            if matches!(*slot, SessionSlot::Stopped) {
+                return;
+            }
+            *slot = SessionSlot::Stopped;
+            self.state.send_replace(ConnectionState::Stopped);
+            self.task.abort();
+        }
+        log::debug!("transport stopped");
     }
 }
 
@@ -381,8 +390,8 @@ impl Drop for Inner {
     }
 }
 
-async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
-    let stream = TcpStream::connect((host, port)).await?;
+async fn connect_tcp(address: SocketAddr) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect(address).await?;
     stream.set_nodelay(true)?;
     SockRef::from(&stream).set_tcp_keepalive(
         &TcpKeepalive::new()
@@ -393,25 +402,79 @@ async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-async fn connect(config: &Config) -> io::Result<Box<dyn NetworkStream>> {
-    timeout(CONNECT_TIMEOUT, async {
-        let socket = connect_tcp(&config.host, config.port).await?;
-        let network: Box<dyn NetworkStream> = match &config.tls {
-            Some(tls) => Box::new(
-                TlsConnector::new(tls.clone())
-                    .connect(&config.host, socket)
-                    .await
-                    .map_err(|error| match error {
-                        tokio_aws_lc::Error::Io(error) => error,
-                        error => io::Error::other(error),
-                    })?,
-            ),
-            None => Box::new(socket),
-        };
-        Ok(network)
+enum AddressError {
+    Tcp(io::Error),
+    Tls(io::Error),
+}
+
+async fn connect_address(
+    config: &Config,
+    address: SocketAddr,
+) -> Result<Box<dyn NetworkStream>, AddressError> {
+    let socket = connect_tcp(address).await.map_err(AddressError::Tcp)?;
+    match &config.tls {
+        Some(tls) => Ok(Box::new(
+            TlsConnector::new(tls.clone())
+                .connect(&config.host, socket)
+                .await
+                .map_err(|error| match error {
+                    tokio_aws_lc::Error::Io(error) => error,
+                    error => io::Error::other(error),
+                })
+                .map_err(AddressError::Tls)?,
+        )),
+        None => Ok(Box::new(socket)),
+    }
+}
+
+fn connection_timed_out(_: tokio::time::error::Elapsed) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "connection setup timed out")
+}
+
+async fn connect_addresses(
+    config: &Config,
+    addresses: &[SocketAddr],
+    deadline: Instant,
+) -> io::Result<(Box<dyn NetworkStream>, SocketAddr)> {
+    let mut last_error = io::Error::new(io::ErrorKind::NotFound, "host resolved to no addresses");
+    let mut tls_error = None;
+    for (index, &address) in addresses.iter().enumerate() {
+        log::debug!("trying {address} for {:?}", config.host);
+        let remaining_addresses = u32::try_from(addresses.len() - index).unwrap_or(u32::MAX);
+        let now = Instant::now();
+        let budget = deadline.saturating_duration_since(now) / remaining_addresses;
+        match timeout_at(now + budget, connect_address(config, address)).await {
+            Ok(Ok(network)) => return Ok((network, address)),
+            Ok(Err(AddressError::Tcp(error))) => {
+                log::debug!("TCP setup failed for {address}: {error}");
+                last_error = error;
+            }
+            Ok(Err(AddressError::Tls(error))) => {
+                log::debug!("TLS setup failed for {address}: {error}");
+                tls_error = Some(error);
+            }
+            Err(error) => {
+                log::debug!("connection setup timed out for {address}");
+                last_error = connection_timed_out(error);
+            }
+        }
+    }
+    Err(tls_error.unwrap_or(last_error))
+}
+
+async fn connect(config: &Config) -> io::Result<(Box<dyn NetworkStream>, SocketAddr)> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    timeout_at(deadline, async {
+        let mut addresses: Vec<_> = lookup_host((config.host.as_str(), config.port))
+            .await?
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        fastrand::shuffle(&mut addresses);
+        connect_addresses(config, &addresses, deadline).await
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection setup timed out"))?
+    .map_err(connection_timed_out)?
 }
 
 #[derive(Default)]
@@ -436,6 +499,8 @@ async fn supervise(
     sessions: Arc<Mutex<SessionSlot>>,
     state: watch::Sender<ConnectionState>,
 ) {
+    let host = &config.host;
+    let port = config.port;
     let mut backoff = Backoff::default();
     loop {
         {
@@ -445,8 +510,8 @@ async fn supervise(
             }
             state.send_replace(ConnectionState::Connecting);
         }
-        let error = match connect(&config).await {
-            Ok(network) => {
+        let (peer, error) = match connect(&config).await {
+            Ok((network, address)) => {
                 let session = MultiplexTransport::new_with_max_frame_size(
                     network,
                     Netstring,
@@ -461,6 +526,7 @@ async fn supervise(
                     *slot = SessionSlot::Occupied(session.clone());
                     state.send_replace(ConnectionState::Connected);
                 }
+                log::info!("connected to {host:?}:{port} via {address}");
                 session.closed().await;
                 {
                     let mut slot = sessions.lock().unwrap();
@@ -472,24 +538,44 @@ async fn supervise(
                 if connected_at.elapsed() >= STABLE_CONNECTION {
                     backoff = Backoff::default();
                 }
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "multiplexed session closed or invalidated",
+                (
+                    Some(address),
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "multiplexed session closed or invalidated",
+                    ),
                 )
             }
-            Err(error) => error,
+            Err(error) => (None, error),
         };
         let delay = backoff.next();
+        let attempt = backoff.attempt;
+        let error = Arc::new(error);
         {
             let slot = sessions.lock().unwrap();
             if matches!(*slot, SessionSlot::Stopped) {
                 return;
             }
             state.send_replace(ConnectionState::BackingOff {
-                attempt: backoff.attempt,
+                attempt,
                 delay,
-                error: Arc::new(error),
+                error: error.clone(),
             });
+        }
+        if let Some(address) = peer {
+            log::warn!(
+                "connection to {host:?}:{port} via {address} lost: {error}; retry in {delay:?} (attempt {attempt})"
+            );
+        } else {
+            let level = if attempt == 1 {
+                log::Level::Warn
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
+                level,
+                "connection setup failed for {host:?}:{port}: {error}; retry in {delay:?} (attempt {attempt})"
+            );
         }
         sleep(delay).await;
     }
@@ -529,6 +615,55 @@ mod tests {
             )
             .unwrap();
         (config, TlsAcceptor::new(server_config))
+    }
+
+    async fn refused_tcp_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_addresses_falls_back_after_tcp_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let available = listener.local_addr().unwrap();
+        let config = Config::plaintext("localhost", available.port()).unwrap();
+        let refused_address = refused_tcp_address().await;
+
+        let (mut network, connected_address) = connect_addresses(
+            &config,
+            &[refused_address, available],
+            Instant::now() + CONNECT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(connected_address, available);
+        network.write_all(b"ready").await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut message = [0; 5];
+        peer.read_exact(&mut message).await.unwrap();
+        assert_eq!(&message, b"ready");
+    }
+
+    #[tokio::test]
+    async fn connect_addresses_falls_back_after_stalled_tls() {
+        let stalled = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let available = listener.local_addr().unwrap();
+        let addresses = [stalled.local_addr().unwrap(), available];
+        let (config, acceptor) = tls_config(available.port());
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        let (network, _server) = timeout_at(deadline, async {
+            tokio::join!(connect_addresses(&config, &addresses, deadline), async {
+                let (_stalled_peer, _) = stalled.accept().await.unwrap();
+                let (peer, _) = listener.accept().await.unwrap();
+                acceptor.accept(peer).await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let (_, connected_address) = network.unwrap();
+        assert_eq!(connected_address, available);
     }
 
     async fn ready(transport: &Transport) {
@@ -720,9 +855,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_connections_enable_keepalive_and_nodelay() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stream = connect_tcp("127.0.0.1", listener.local_addr().unwrap().port())
-            .await
-            .unwrap();
+        let stream = connect_tcp(listener.local_addr().unwrap()).await.unwrap();
 
         assert!(SockRef::from(&stream).keepalive().unwrap());
         assert!(stream.nodelay().unwrap());
@@ -839,7 +972,8 @@ mod tests {
     #[tokio::test]
     async fn system_roots_reject_an_untrusted_server() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let untrusted = listener.local_addr().unwrap();
+        let port = untrusted.port();
         let (_, acceptor) = tls_config(port);
         let client = rcgen::generate_simple_self_signed(vec!["service".into()]).unwrap();
         let config = Config::new(
@@ -853,10 +987,14 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             assert!(acceptor.accept(socket).await.is_err());
         });
-        let error = timeout(Duration::from_secs(5), connect(&config))
-            .await
-            .unwrap()
-            .unwrap_err();
+        let refused_address = refused_tcp_address().await;
+        let error = connect_addresses(
+            &config,
+            &[untrusted, refused_address],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("CERTIFICATE_VERIFY_FAILED"));
         server.await.unwrap();
     }

@@ -19,7 +19,12 @@ PROXY v2 header belongs on its backend connection, not on this client connection
 - Always enable TCP_NODELAY and TCP keepalive: 30 seconds idle, 10 seconds between
   probes, and three probes. Actual failure detection depends on the operating
   system and network. Fail setup if required socket options cannot be applied.
+- Resolve A and AAAA records through the system resolver on every connection
+  round and try the addresses in a fresh random order. TLS verifies the configured
+  hostname, not the selected IP address.
 - Limit DNS resolution, TCP connection, and TLS negotiation to ten seconds total.
+  Each address gets a share of the remaining time, so failed or stalled TCP or
+  TLS setup can fall back to another address before entering backoff.
 - Reconnect after setup errors, EOF, or stream I/O errors. Retry indefinitely with
   exponential backoff starting at 250 ms and capped at 30 seconds, jittered by up
   to 50 percent without exceeding the cap. Reset backoff after 30 seconds connected.
@@ -57,6 +62,16 @@ native TLS engine; no insecure verification option is exposed. Linux kTLS offloa
 is disabled because this release does not support post-attach TLS 1.3 session
 tickets or key updates; userspace TLS retains compatibility with HAProxy's
 post-handshake messages.
+
+## Connection logging
+
+The transport emits events through the `log` crate under the `latigo_client`
+target. The application installs and configures its own logger. `info` reports
+established connections and their selected peer addresses. `warn` reports
+lost connections and the first failure in a retry sequence, including the retry
+delay. Enable `debug` for individual address attempts, TCP and TLS setup failures,
+timeouts, subsequent failed rounds, and shutdown. Connection events do not
+include credentials or RPC payloads.
 
 ## Plaintext testing
 
